@@ -6,16 +6,31 @@ openbsd_branch=`cat OPENBSD_BRANCH`
 # pull in latest upstream code
 echo "pulling upstream openbsd source"
 if [ ! -d openbsd ]; then
-	if [ -z "$LIBRESSL_GIT" ]; then
-		git clone https://github.com/libressl-portable/openbsd.git
-	else
-		git clone $LIBRESSL_GIT/openbsd
-	fi
+	LIBRESSL_GIT_OPTIONS="${LIBRESSL_GIT_OPTIONS:- --depth=8}"
+	LIBRESSL_GIT="${LIBRESSL_GIT:- https://github.com/libressl}"
+	git clone $LIBRESSL_GIT_OPTIONS $LIBRESSL_GIT/openbsd
 fi
-(cd openbsd
- git fetch
- git checkout $openbsd_branch
- git pull --rebase)
+
+# pull either the latest or if on a tag, the matching tag
+set +e
+tag=`git describe --exact-match --tags HEAD 2>/dev/null`
+is_tag=$?
+# adjust for 9 hour time delta between trees
+release_ts=$((`git show -s --format=%ct $tag|tail -1` + 32400))
+commit=`git -C openbsd rev-list -n 1 --before=$release_ts $openbsd_branch`
+git -C openbsd fetch
+if [ $is_tag -eq 0 ]; then
+  echo "This is tag $tag, trying OpenBSD tag libressl-$tag"
+  if ! git -C openbsd checkout "libressl-$tag"; then
+    echo "No matching OpenBSD tag found trying nearest commit $commit"
+    git -C openbsd checkout -q $commit
+  fi
+else
+  echo "Not on a tag, grabbing latest (NOTE: this may be broken from time to time)"
+  git -C openbsd checkout $openbsd_branch
+  git -C openbsd pull
+fi
+set -e
 
 # setup source paths
 CWD=`pwd`
@@ -70,7 +85,6 @@ fi
 
 $CP $libssl_src/LICENSE COPYING
 
-$CP $libcrypto_src/arch/amd64/opensslconf.h include/openssl
 $CP $libcrypto_src/opensslfeatures.h include/openssl
 $CP $libssl_src/pqueue.h include
 
@@ -113,20 +127,20 @@ copy_hdrs() {
 
 copy_hdrs $libcrypto_src "stack/stack.h lhash/lhash.h stack/safestack.h
 	ossl_typ.h err/err.h crypto.h comp/comp.h x509/x509.h buffer/buffer.h
-	objects/objects.h asn1/asn1.h bn/bn.h ec/ec.h ecdsa/ecdsa.h
+	objects/objects.h asn1/asn1.h asn1/posix_time.h bn/bn.h ec/ec.h ecdsa/ecdsa.h
 	ecdh/ecdh.h rsa/rsa.h sha/sha.h x509/x509_vfy.h pkcs7/pkcs7.h pem/pem.h
-	pem/pem2.h hkdf/hkdf.h hmac/hmac.h rand/rand.h md5/md5.h
-	x509/x509v3.h x509/x509_verify.h conf/conf.h ocsp/ocsp.h
-	aes/aes.h modes/modes.h asn1/asn1t.h dso/dso.h bf/blowfish.h
-	bio/bio.h cast/cast.h cmac/cmac.h cms/cms.h conf/conf_api.h des/des.h dh/dh.h
+	hkdf/hkdf.h hmac/hmac.h rand/rand.h md5/md5.h
+	x509/x509v3.h conf/conf.h ocsp/ocsp.h
+	aes/aes.h modes/modes.h asn1/asn1t.h bf/blowfish.h
+	bio/bio.h cast/cast.h cmac/cmac.h cms/cms.h des/des.h dh/dh.h
 	dsa/dsa.h engine/engine.h ui/ui.h pkcs12/pkcs12.h ts/ts.h
-	md4/md4.h ripemd/ripemd.h whrlpool/whrlpool.h idea/idea.h
-	rc2/rc2.h rc4/rc4.h ui/ui_compat.h txt_db/txt_db.h
+	md4/md4.h ripemd/ripemd.h idea/idea.h
+	rc2/rc2.h rc4/rc4.h txt_db/txt_db.h
 	sm3/sm3.h sm4/sm4.h chacha/chacha.h evp/evp.h poly1305/poly1305.h
-	camellia/camellia.h gost/gost.h curve25519/curve25519.h
+	camellia/camellia.h curve25519/curve25519.h
 	ct/ct.h kdf/kdf.h"
 
-copy_hdrs $libssl_src "srtp.h ssl.h ssl2.h ssl3.h ssl23.h tls1.h dtls1.h"
+copy_hdrs $libssl_src "srtp.h ssl.h ssl3.h tls1.h dtls1.h"
 
 # override upstream opensslv.h if a local version exists
 if [ -f patches/opensslv.h ]; then
@@ -135,12 +149,13 @@ else
 	$CP $libcrypto_src/opensslv.h include/openssl
 fi
 
-awk '/LIBRESSL_VERSION_TEXT/ {print $4}' < include/openssl/opensslv.h | cut -d\" -f1 > VERSION
+awk '/LIBRESSL_VERSION_TEXT/ {print $4}' < include/openssl/opensslv.h | cut -d\" -f1 | head -n1 > VERSION
 echo "LibreSSL version `cat VERSION`"
 
 # copy libcrypto source
 echo copying libcrypto source
 rm -f crypto/*.c crypto/*.h
+touch crypto/empty.c
 for i in `awk '/SOURCES|HEADERS/ { print $3 }' crypto/Makefile.am` ; do
 	dir=`dirname $i`
 	mkdir -p crypto/$dir
@@ -150,13 +165,32 @@ for i in `awk '/SOURCES|HEADERS/ { print $3 }' crypto/Makefile.am` ; do
 		fi
 	fi
 done
+
+for i in $libcrypto_src/arch/*; do
+	arch=`basename $i`
+	mkdir -p include/arch/$arch
+	$CP $libcrypto_src/arch/$arch/opensslconf.h include/arch/$arch/
+	mkdir -p crypto/arch/$arch
+	$CP $libcrypto_src/arch/$arch/crypto_arch.h crypto/arch/$arch/
+	crypto_cpu_caps=$libcrypto_src/arch/$arch/crypto_cpu_caps.c
+	if [ -f "$crypto_cpu_caps" ]; then
+		$CP "$crypto_cpu_caps" crypto/arch/$arch/
+	fi
+done
+
+for i in $libcrypto_src/bn/arch/*; do
+	arch=`basename $i`
+	mkdir -p crypto/bn/arch/$arch
+	$CP $libcrypto_src/bn/arch/$arch/* crypto/bn/arch/$arch/
+done
+
 $CP crypto/compat/b_win.c crypto/bio
 $CP crypto/compat/ui_openssl_win.c crypto/ui
 # add the libcrypto symbol export list
 $GREP -v OPENSSL_ia32cap_P $libcrypto_src/Symbols.list | $GREP '^[A-Za-z0-9_]' > crypto/crypto.sym
 
 fixup_masm() {
-	cpp -I./crypto $1     \
+	cpp -I./crypto -I./include/compat -D_MSC_VER -U__CET__ $1 \
 		| sed -e 's/^#/;/'    \
 		| sed -e 's/|/OR/g'   \
 		| sed -e 's/~/NOT/g'  \
@@ -166,71 +200,95 @@ fixup_masm() {
 
 # generate assembly crypto algorithms
 asm_src=$libcrypto_src
+
 gen_asm_stdout() {
-	CC=true perl $asm_src/$2 $1 > $3.tmp
-	[ $1 = "elf" ] && cat <<-EOF >> $3.tmp
+	CC=true perl $asm_src/$2 $1 > crypto/$3.tmp
+	[ $1 = "elf" ] && cat <<-EOF >> crypto/$3.tmp
 	#if defined(HAVE_GNU_STACK)
 	.section .note.GNU-stack,"",%progbits
 	#endif
 	EOF
 	if [ $1 = "masm" ]; then
-		fixup_masm $3.tmp $3
+		fixup_masm crypto/$3.tmp crypto/$3
 	else
-		$MV $3.tmp $3
-	fi
-}
-gen_asm() {
-	CC=true perl $asm_src/$2 $1 $3.tmp
-	[ $1 = "elf" ] && cat <<-EOF >> $3.tmp
-	#if defined(HAVE_GNU_STACK)
-	.section .note.GNU-stack,"",%progbits
-	#endif
-	EOF
-	if [ $1 = "masm" ]; then
-		fixup_masm $3.tmp $3
-	else
-		$MV $3.tmp $3
+		$MV crypto/$3.tmp crypto/$3
 	fi
 }
 
+gen_asm_mips() {
+	abi=$1
+	dir=$2
+	src=$3
+	dst=$4
+	CC=true perl $asm_src/$dir/asm/$src.pl $abi $dst.S
+	cat <<-EOF >> $dst.S
+	#if defined(HAVE_GNU_STACK)
+	.section .note.GNU-stack,"",%progbits
+	#endif
+	EOF
+	mv $dst.S crypto/$dir/$dst.S
+}
+
+gen_asm() {
+	CC=true perl $asm_src/$2 $1 crypto/$3.tmp
+	[ $1 = "elf" ] && cat <<-EOF >> crypto/$3.tmp
+	#if defined(HAVE_GNU_STACK)
+	.section .note.GNU-stack,"",%progbits
+	#endif
+	EOF
+	if [ $1 = "masm" ]; then
+		fixup_masm crypto/$3.tmp crypto/$3
+	else
+		$MV crypto/$3.tmp crypto/$3
+	fi
+}
+
+echo generating mips ASM source for elf
+gen_asm_mips o32 aes aes-mips    aes-mips
+gen_asm_mips o32 bn  mips        bn-mips
+gen_asm_mips o32 bn  mips-mont   mont-mips
+gen_asm_mips o32 sha sha1-mips   sha1-mips
+gen_asm_mips o32 sha sha512-mips sha256-mips
+gen_asm_mips o32 sha sha512-mips sha512-mips
+
+echo generating mips64 ASM source for elf
+gen_asm_mips 64 aes aes-mips    aes-mips64
+gen_asm_mips 64 bn  mips        bn-mips64
+gen_asm_mips 64 bn  mips-mont   mont-mips64
+gen_asm_mips 64 sha sha1-mips   sha1-mips64
+gen_asm_mips 64 sha sha512-mips sha256-mips64
+gen_asm_mips 64 sha sha512-mips sha512-mips64
+
 echo generating arm ASM source for elf
-gen_asm_stdout elf aes/asm/aes-armv4.pl crypto/aes/aes-elf-armv4.S
-gen_asm_stdout elf bn/asm/armv4-gf2m.pl crypto/bn/gf2m-elf-armv4.S
-gen_asm_stdout elf bn/asm/armv4-mont.pl crypto/bn/mont-elf-armv4.S
-gen_asm_stdout elf sha/asm/sha1-armv4-large.pl crypto/sha/sha1-elf-armv4.S
-gen_asm_stdout elf sha/asm/sha256-armv4.pl crypto/sha/sha256-elf-armv4.S
-gen_asm_stdout elf sha/asm/sha512-armv4.pl crypto/sha/sha512-elf-armv4.S
-gen_asm_stdout elf modes/asm/ghash-armv4.pl crypto/modes/ghash-elf-armv4.S
+gen_asm_stdout elf aes/asm/aes-armv4.pl        aes/aes-elf-armv4.S
+gen_asm_stdout elf bn/asm/armv4-mont.pl        bn/mont-elf-armv4.S
+gen_asm_stdout elf sha/asm/sha1-armv4-large.pl sha/sha1-elf-armv4.S
+gen_asm_stdout elf sha/asm/sha256-armv4.pl     sha/sha256-elf-armv4.S
+gen_asm_stdout elf sha/asm/sha512-armv4.pl     sha/sha512-elf-armv4.S
+gen_asm_stdout elf modes/asm/ghash-armv4.pl    modes/ghash-elf-armv4.S
 $CP $libcrypto_src/arch/arm/armv4cpuid.S crypto
 $CP $libcrypto_src/arch/arm/armcap.c crypto
 $CP $libcrypto_src/arch/arm/arm_arch.h crypto
 
 for abi in elf macosx masm mingw64; do
 	echo generating x86_64 ASM source for $abi
-	gen_asm_stdout $abi aes/asm/aes-x86_64.pl        crypto/aes/aes-$abi-x86_64.S
-	gen_asm_stdout $abi aes/asm/vpaes-x86_64.pl      crypto/aes/vpaes-$abi-x86_64.S
-	gen_asm_stdout $abi aes/asm/bsaes-x86_64.pl      crypto/aes/bsaes-$abi-x86_64.S
-	gen_asm_stdout $abi aes/asm/aesni-x86_64.pl      crypto/aes/aesni-$abi-x86_64.S
-	gen_asm_stdout $abi aes/asm/aesni-sha1-x86_64.pl crypto/aes/aesni-sha1-$abi-x86_64.S
-	gen_asm_stdout $abi bn/asm/modexp512-x86_64.pl   crypto/bn/modexp512-$abi-x86_64.S
-	gen_asm_stdout $abi bn/asm/x86_64-mont.pl        crypto/bn/mont-$abi-x86_64.S
-	gen_asm_stdout $abi bn/asm/x86_64-mont5.pl       crypto/bn/mont5-$abi-x86_64.S
-	gen_asm_stdout $abi bn/asm/x86_64-gf2m.pl        crypto/bn/gf2m-$abi-x86_64.S
-	gen_asm_stdout $abi camellia/asm/cmll-x86_64.pl  crypto/camellia/cmll-$abi-x86_64.S
-	gen_asm_stdout $abi md5/asm/md5-x86_64.pl        crypto/md5/md5-$abi-x86_64.S
-	gen_asm_stdout $abi modes/asm/ghash-x86_64.pl    crypto/modes/ghash-$abi-x86_64.S
-	gen_asm_stdout $abi rc4/asm/rc4-x86_64.pl        crypto/rc4/rc4-$abi-x86_64.S
-	gen_asm_stdout $abi rc4/asm/rc4-md5-x86_64.pl    crypto/rc4/rc4-md5-$abi-x86_64.S
-	gen_asm_stdout $abi sha/asm/sha1-x86_64.pl       crypto/sha/sha1-$abi-x86_64.S
-	gen_asm        $abi sha/asm/sha512-x86_64.pl     crypto/sha/sha256-$abi-x86_64.S
-	gen_asm        $abi sha/asm/sha512-x86_64.pl     crypto/sha/sha512-$abi-x86_64.S
-	gen_asm_stdout $abi whrlpool/asm/wp-x86_64.pl    crypto/whrlpool/wp-$abi-x86_64.S
-	gen_asm        $abi x86_64cpuid.pl               crypto/cpuid-$abi-x86_64.S
+
+	gen_asm_stdout $abi aes/asm/aes-x86_64.pl        aes/aes-$abi-x86_64.S
+	gen_asm_stdout $abi aes/asm/vpaes-x86_64.pl      aes/vpaes-$abi-x86_64.S
+	gen_asm_stdout $abi aes/asm/bsaes-x86_64.pl      aes/bsaes-$abi-x86_64.S
+	gen_asm_stdout $abi aes/asm/aesni-x86_64.pl      aes/aesni-$abi-x86_64.S
+	gen_asm_stdout $abi bn/asm/modexp512-x86_64.pl   bn/modexp512-$abi-x86_64.S
+	gen_asm_stdout $abi bn/asm/x86_64-mont.pl        bn/mont-$abi-x86_64.S
+	gen_asm_stdout $abi bn/asm/x86_64-mont5.pl       bn/mont5-$abi-x86_64.S
+	gen_asm_stdout $abi md5/asm/md5-x86_64.pl        md5/md5-$abi-x86_64.S
+	gen_asm_stdout $abi modes/asm/ghash-x86_64.pl    modes/ghash-$abi-x86_64.S
+	gen_asm_stdout $abi rc4/asm/rc4-x86_64.pl        rc4/rc4-$abi-x86_64.S
 done
 
 # copy libtls source
 echo copying libtls source
 rm -f tls/*.c tls/*.h libtls/src/*.c libtls/src/*.h
+touch tls/empty.c
 for i in `awk '/SOURCES|HEADERS/ { print $3 }' tls/Makefile.am` ; do
 	if [ -e $libtls_src/$i ]; then
 		$CP $libtls_src/$i tls
@@ -276,19 +334,27 @@ done
 # copy libssl source
 echo "copying libssl source"
 rm -f ssl/*.c ssl/*.h
-for i in `awk '/SOURCES|HEADERS/ { print $3 }' ssl/Makefile.am` ; do
-	$CP $libssl_src/$i ssl
+touch ssl/empty.c
+for i in `awk '/SOURCES|HEADERS/ { if ($3 !~ /.*crypto_arch.*/) print $3 }' ssl/Makefile.am` ; do
+	dir=`dirname $i`
+	mkdir -p ssl/$dir
+	$CP $libssl_src/$i ssl/$i
 done
 # add the libssl symbol export list
 $GREP '^[A-Za-z0-9_]' < $libssl_src/Symbols.list > ssl/ssl.sym
 
 # copy libcrypto tests
 echo "copying tests"
-for i in `find $libcrypto_regress -name '*.c'`; do
+touch tests/empty.c
+for i in `find $libcrypto_regress -name '*.[ch]'`; do
 	 $CP "$i" tests
 done
 $CP $libcrypto_regress/evp/evptests.txt tests
-$CP $libcrypto_regress/aead/aeadtests.txt tests
+$CP $libcrypto_regress/aead/*.txt tests
+$CP $libcrypto_regress/ct/ctlog.conf tests
+$CP $libcrypto_regress/ct/*.crt tests
+$CP $libcrypto_regress/x509/policy/*.pem tests
+$CP $libcrypto_regress/mlkem/*.txt tests
 
 # generate libcrypto freenull.c
 awk -f $libcrypto_regress/free/freenull.awk \
@@ -309,8 +375,8 @@ for i in `find $libssl_regress -name '*.c'`; do
 	 $CP "$i" tests
 done
 $CP $libssl_regress/unit/tests.h tests
-$CP $libssl_regress/certs/ca.pem tests
-$CP $libssl_regress/certs/server.pem tests
+$CP $libssl_regress/certs/*.pem tests
+$CP $libssl_regress/certs/*.crl tests
 $CP $libssl_regress/pqueue/expected.txt tests/pq_expected.txt
 
 # copy libtls tests
